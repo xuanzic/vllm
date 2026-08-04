@@ -48,6 +48,38 @@ uv pip install --editable .
 export PYTHONPATH="$PWD:$(dirname "$PWD")/flashinfer-v0.6.14-fp8"
 ```
 
+Verify that Python resolves FlashInfer to the development checkout:
+
+```bash
+python -c 'import flashinfer; print(flashinfer.__file__)'
+```
+
+### Force the patched dequantization module to JIT
+
+The vLLM image's separately installed `flashinfer_jit_cache` package may
+contain an older precompiled `fp4_kv_dequant.so`. That binary does not include
+the direct FP8 output added by the compatibility branch and can take
+precedence even when the `flashinfer` Python package resolves to the checkout.
+
+Inside the development container, rename only that AOT artifact as root:
+
+```bash
+NVFP4_DEQUANT_AOT=/usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache/jit_cache/fp4_kv_dequant/fp4_kv_dequant.so
+mv "$NVFP4_DEQUANT_AOT" "${NVFP4_DEQUANT_AOT}.disabled-direct-fp8"
+```
+
+The next `nvfp4_kv_dequantize` call then JIT-compiles the module from the
+patched FlashInfer source. Do not disable the entire `flashinfer_jit_cache`
+package: the other FlashInfer 0.6.14 attention cubins must remain available and
+ABI-matched to vLLM 0.26.0.
+
+To restore the original dequantization artifact:
+
+```bash
+NVFP4_DEQUANT_AOT=/usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache/jit_cache/fp4_kv_dequant/fp4_kv_dequant.so
+mv "${NVFP4_DEQUANT_AOT}.disabled-direct-fp8" "$NVFP4_DEQUANT_AOT"
+```
+
 Do not mix the default CUDA 13.0 v0.26.0 wheel with a CUDA 12.9 image. An
 equivalent container-development setup can reuse the exact native extension
 artifacts already installed in the matching image while loading all Python
