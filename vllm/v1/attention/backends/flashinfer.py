@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
+import os
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
@@ -14,6 +15,7 @@ from flashinfer import (
     BatchPrefillWithPagedKVCacheWrapper,
     BatchPrefillWithRaggedKVCacheWrapper,
     MultiLevelCascadeAttentionWrapper,
+    nvfp4_kv_dequantize,
 )
 from flashinfer.decode import fast_decode_plan, trtllm_batch_decode_with_kv_cache
 from flashinfer.prefill import trtllm_batch_context_with_kv_cache
@@ -88,6 +90,58 @@ FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
 
 logger = init_logger(__name__)
+
+# Functional/accuracy bridge for head dimensions without a native NVFP4
+# attention specialization. The allocated paged cache remains NVFP4, but the
+# full physical cache is dequantized to a temporary FP8 cache before calling
+# the existing FP8 attention path. This is intentionally not a performance
+# implementation.
+GEMMA4_NVFP4_PHYSICAL_DEQUANT_FP8_BRIDGE = (
+    os.getenv("GEMMA4_NVFP4_PHYSICAL_DEQUANT_FP8_BRIDGE", "0") == "1"
+)
+
+if GEMMA4_NVFP4_PHYSICAL_DEQUANT_FP8_BRIDGE:
+    logger.warning("Enabled physical NVFP4 cache -> FP8 attention bridge.")
+
+
+def _dequant_physical_nvfp4_side_to_fp8(
+    packed_cache: torch.Tensor,
+    global_scale: torch.Tensor,
+    *,
+    is_value: bool,
+) -> torch.Tensor:
+    data, block_scales = nvfp4_split_data_scale(packed_cache)
+    if is_value:
+        # reshape_and_cache_flash writes NVFP4 V scales in TRTLLM-GEN's
+        # 4-token-interleaved HND layout.  nvfp4_kv_dequantize expects linear
+        # per-token scales, so undo that swizzle before flattening to [M, K].
+        pages, heads, tokens, scale_dim = block_scales.shape
+        if tokens % 4 != 0 or scale_dim % 4 != 0:
+            raise ValueError(
+                "NVFP4 V-scale unswizzle requires page_size and scale_dim "
+                f"divisible by 4, got tokens={tokens}, scale_dim={scale_dim}."
+            )
+        block_scales = (
+            block_scales.reshape(pages, heads, tokens // 4, 4, scale_dim // 4, 4)
+            .permute(0, 1, 2, 5, 3, 4)
+            .reshape(pages, heads, tokens, scale_dim)
+            .contiguous()
+        )
+    logical_shape = (*data.shape[:-1], data.shape[-1] * 2)
+    data_2d = data.contiguous().view(-1, data.shape[-1])
+    scales_u8 = block_scales.contiguous().view(torch.uint8)
+    scales_2d = scales_u8.view(-1, scales_u8.shape[-1])
+    scale = global_scale.to(device=packed_cache.device, dtype=torch.float32).reshape(1)
+    dequantized = nvfp4_kv_dequantize(
+        data_2d,
+        scales_2d,
+        scale,
+        output_dtype=torch.float8_e4m3fn,
+    )
+    # The fallback uses an explicit FP8 scale of 1.0, so FMHA must not apply
+    # the checkpoint's NVFP4 global scale a second time.
+    return dequantized.view(logical_shape)
+
 
 trtllm_workspace_buffer = None
 
@@ -707,9 +761,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.cache_dtype = self.cache_config.cache_dtype
             # Cannot use self.kv_cache_spec.dtype here because kv_cache_spec
             # storage dtype may not be the same as the op dtype (uint8 vs fp8_e4m3)
-            self.is_kvcache_nvfp4 = self.cache_dtype == "nvfp4"
-            if self.is_kvcache_nvfp4:
-                if (
+            physical_kvcache_nvfp4 = self.cache_dtype == "nvfp4"
+            self.is_kvcache_nvfp4 = (
+                physical_kvcache_nvfp4 and not GEMMA4_NVFP4_PHYSICAL_DEQUANT_FP8_BRIDGE
+            )
+            if physical_kvcache_nvfp4:
+                if not GEMMA4_NVFP4_PHYSICAL_DEQUANT_FP8_BRIDGE and (
                     force_use_trtllm_attention() is False
                     or not supports_trtllm_attention(is_prefill=True)
                     or not supports_trtllm_attention(is_prefill=False)
@@ -718,9 +775,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         "--kv-cache-dtype nvfp4 requires the SM100 trtllm-gen "
                         "FlashInfer path."
                     )
-                # For NVFP4, kv_cache_dtype stays as the string "nvfp4"
-                # which is passed to FlashInferImpl
-                self.kv_cache_dtype = self.cache_dtype
+                # The bridge plans ordinary FP8 attention while the cache spec
+                # still allocates packed NVFP4 physical storage.
+                self.kv_cache_dtype = (
+                    FP8_DTYPE
+                    if GEMMA4_NVFP4_PHYSICAL_DEQUANT_FP8_BRIDGE
+                    else self.cache_dtype
+                )
             else:
                 self.kv_cache_dtype = FlashInferBackend.get_dtype_for_flashinfer(
                     self.cache_dtype
@@ -1556,8 +1617,15 @@ class FlashInferImpl(AttentionImpl):
         self.window_left = (
             self.sliding_window[0] if self.sliding_window is not None else -1
         )
-        self.kv_cache_dtype = kv_cache_dtype
-        self.is_kvcache_nvfp4 = kv_cache_dtype == "nvfp4"
+        self.kv_cache_dtype = (
+            "fp8" if GEMMA4_NVFP4_PHYSICAL_DEQUANT_FP8_BRIDGE else kv_cache_dtype
+        )
+        self.physical_nvfp4_dequant_fp8_bridge = (
+            GEMMA4_NVFP4_PHYSICAL_DEQUANT_FP8_BRIDGE
+        )
+        self.is_kvcache_nvfp4 = (
+            kv_cache_dtype == "nvfp4" and not self.physical_nvfp4_dequant_fp8_bridge
+        )
         self.fp4_data_dim = head_size // 2 if self.is_kvcache_nvfp4 else 0
         self.logits_soft_cap = logits_soft_cap
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
@@ -1650,7 +1718,9 @@ class FlashInferImpl(AttentionImpl):
         if is_quantized_kv_cache(self.kv_cache_dtype):
             if q_data_type in (torch.float8_e4m3fn, torch.float8_e5m2):
                 bmm1_scale *= layer._q_scale_float
-            bmm1_scale *= layer._k_scale_float
+            bmm1_scale *= (
+                1.0 if self.physical_nvfp4_dequant_fp8_bridge else layer._k_scale_float
+            )
         return bmm1_scale
 
     # SM90 may need FP8-Q for native prefill and BF16/FP16-Q for XQA decode,
@@ -1705,15 +1775,22 @@ class FlashInferImpl(AttentionImpl):
             # Profiling run.
             return output.fill_(0)
 
+        bridge_k_scale_float = (
+            1.0 if self.physical_nvfp4_dequant_fp8_bridge else layer._k_scale_float
+        )
+        bridge_v_scale_float = (
+            1.0 if self.physical_nvfp4_dequant_fp8_bridge else layer._v_scale_float
+        )
+
         if self.bmm1_scale is None:
             self.bmm1_scale = self.scale
             if is_quantized_kv_cache(self.kv_cache_dtype):
-                self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
+                self.bmm1_scale *= layer._q_scale_float * bridge_k_scale_float
 
         if self.bmm2_scale is None:
             self.bmm2_scale = 1.0
             if is_quantized_kv_cache(self.kv_cache_dtype):
-                self.bmm2_scale *= layer._v_scale_float
+                self.bmm2_scale *= bridge_v_scale_float
 
         prefill_use_trtllm = isinstance(attn_metadata.prefill, TRTLLMPrefill)
         decode_kernel = (
@@ -1775,7 +1852,11 @@ class FlashInferImpl(AttentionImpl):
 
         # FlashInfer treats uint8 KV cache as NVFP4. vLLM stores FP8 KV cache
         # as uint8 bytes, so pass FP8 caches with their logical dtype.
-        if not self.is_kvcache_nvfp4 and kv_cache.dtype == torch.uint8:
+        if (
+            not self.is_kvcache_nvfp4
+            and not self.physical_nvfp4_dequant_fp8_bridge
+            and kv_cache.dtype == torch.uint8
+        ):
             fp8_view_dtype = None
             if self.kv_cache_dtype in ("fp8", "fp8_e4m3", torch.float8_e4m3fn):
                 fp8_view_dtype = torch.float8_e4m3fn
@@ -1793,9 +1874,14 @@ class FlashInferImpl(AttentionImpl):
 
         if attn_metadata.use_cascade:
             # Cascade attention (rare case).
+            if self.physical_nvfp4_dequant_fp8_bridge:
+                raise NotImplementedError(
+                    "The physical NVFP4 dequant-to-FP8 bridge does not support "
+                    "cascade attention."
+                )
             assert attn_metadata.cascade_wrapper is not None
             stride_order = FlashInferBackend.get_kv_cache_stride_order()
-            if self.is_kvcache_nvfp4:
+            if self.is_kvcache_nvfp4 or self.physical_nvfp4_dequant_fp8_bridge:
                 kv_cache_views = tuple(
                     cache.permute(*stride_order)
                     for cache in kv_cache.split(self.num_kv_heads, dim=1)
@@ -1837,16 +1923,46 @@ class FlashInferImpl(AttentionImpl):
         hs = self.head_size
         nvfp4_kv_data = None
         nvfp4_kv_block_scales = None
-        if self.is_kvcache_nvfp4:
+        if self.is_kvcache_nvfp4 or self.physical_nvfp4_dequant_fp8_bridge:
             k_cache, v_cache = kv_cache.split(self.num_kv_heads, dim=1)
-            kv_cache_tuple = (
+            packed_kv_cache_tuple = (
                 canonicalize_singleton_dim_strides(k_cache.permute(*stride_order)),
                 canonicalize_singleton_dim_strides(v_cache.permute(*stride_order)),
             )
-            k_data, k_sf = nvfp4_split_data_scale(kv_cache_tuple[0])
-            v_data, v_sf = nvfp4_split_data_scale(kv_cache_tuple[1])
-            nvfp4_kv_data = (k_data, v_data)
-            nvfp4_kv_block_scales = (k_sf, v_sf)
+            if self.physical_nvfp4_dequant_fp8_bridge:
+                logger.warning_once(
+                    "Dequantizing the physical NVFP4 paged cache to a "
+                    "temporary FP8 cache before H512 attention."
+                )
+                temp_k = _dequant_physical_nvfp4_side_to_fp8(
+                    packed_kv_cache_tuple[0],
+                    layer._k_scale,
+                    is_value=False,
+                )
+                temp_v = _dequant_physical_nvfp4_side_to_fp8(
+                    packed_kv_cache_tuple[1],
+                    layer._v_scale,
+                    is_value=True,
+                )
+                # Match vLLM's normal FP8 cache allocation exactly: K and V
+                # are views into one [..., 2 * head_size] allocation.  Some
+                # FlashInfer paths consume the tensor strides, so two
+                # independently contiguous tensors are not equivalent.
+                temp_combined = torch.empty(
+                    (*temp_k.shape[:-1], 2 * hs),
+                    dtype=FP8_DTYPE,
+                    device=temp_k.device,
+                )
+                temp_k_view, temp_v_view = temp_combined.split(hs, dim=-1)
+                temp_k_view.copy_(temp_k)
+                temp_v_view.copy_(temp_v)
+                kv_cache_tuple = (temp_k_view, temp_v_view)
+            else:
+                kv_cache_tuple = packed_kv_cache_tuple
+                k_data, k_sf = nvfp4_split_data_scale(kv_cache_tuple[0])
+                v_data, v_sf = nvfp4_split_data_scale(kv_cache_tuple[1])
+                nvfp4_kv_data = (k_data, v_data)
+                nvfp4_kv_block_scales = (k_sf, v_sf)
         else:
             kv_cache_tuple = kv_cache_permute.split(hs, dim=-1)
 
@@ -1926,8 +2042,8 @@ class FlashInferImpl(AttentionImpl):
                         prefill_query,
                         kv_cache_for_fi,
                         q_scale=layer._q_scale_float,
-                        k_scale=layer._k_scale_float,
-                        v_scale=layer._v_scale_float,
+                        k_scale=bridge_k_scale_float,
+                        v_scale=bridge_v_scale_float,
                         out=out_prefill,
                         kv_cache_sf=kv_cache_sf,
                     )
@@ -2092,8 +2208,8 @@ class FlashInferImpl(AttentionImpl):
                         decode_query,
                         kv_cache_for_fi,
                         q_scale=layer._q_scale_float,
-                        k_scale=layer._k_scale_float,
-                        v_scale=layer._v_scale_float,
+                        k_scale=bridge_k_scale_float,
+                        v_scale=bridge_v_scale_float,
                         out=output_tmp,
                         lse=lse,
                         return_lse=True,
@@ -2109,8 +2225,8 @@ class FlashInferImpl(AttentionImpl):
                         decode_query,
                         kv_cache_for_fi,
                         q_scale=layer._q_scale_float,
-                        k_scale=layer._k_scale_float,
-                        v_scale=layer._v_scale_float,
+                        k_scale=bridge_k_scale_float,
+                        v_scale=bridge_v_scale_float,
                         out=out_decode,
                         kv_cache_sf=kv_cache_sf,
                     )
@@ -2264,7 +2380,7 @@ class FlashInferImpl(AttentionImpl):
             # and value[:num_actual_tokens] because the reshape_and_cache_flash
             # op uses the slot_mapping's shape to determine the number of
             # actual tokens.
-            if self.is_kvcache_nvfp4:
+            if self.is_kvcache_nvfp4 or self.physical_nvfp4_dequant_fp8_bridge:
                 # (B, 2*H, N, full_dim) -> ((B, N, H, full_dim),
                 #                            (B, N, H, full_dim));
                 # K heads first, then V heads.
@@ -2282,7 +2398,11 @@ class FlashInferImpl(AttentionImpl):
                 k_cache,
                 v_cache,
                 slot_mapping,
-                self.kv_cache_dtype,
+                (
+                    "nvfp4"
+                    if self.physical_nvfp4_dequant_fp8_bridge
+                    else self.kv_cache_dtype
+                ),
                 layer._k_scale,
                 layer._v_scale,
             )
