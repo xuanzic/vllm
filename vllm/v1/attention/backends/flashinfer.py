@@ -92,6 +92,14 @@ FP4_DTYPE = torch.uint8
 logger = init_logger(__name__)
 
 
+def _use_prims_ts_nvfp4_decode(
+    physical_kvcache_nvfp4: bool, head_dim: int
+) -> bool:
+    """Select mixed-precision prims+TS for supported NVFP4 head sizes."""
+
+    return physical_kvcache_nvfp4 and head_dim in (256, 512)
+
+
 def _prims_ts_max_kv_len_bucket(max_kv_len: int, page_size: int) -> int:
     """Return a stable power-of-two upper bound for prims+TS decode."""
     if max_kv_len <= 0:
@@ -954,8 +962,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # Cannot use self.kv_cache_spec.dtype here because kv_cache_spec
             # storage dtype may not be the same as the op dtype (uint8 vs fp8_e4m3)
             physical_kvcache_nvfp4 = self.cache_dtype.startswith("nvfp4")
-            self.use_prims_ts_nvfp4_decode = (
-                physical_kvcache_nvfp4 and self.head_dim == 512
+            self.use_prims_ts_nvfp4_decode = _use_prims_ts_nvfp4_decode(
+                physical_kvcache_nvfp4, self.head_dim
             )
             self.is_kvcache_nvfp4 = (
                 physical_kvcache_nvfp4 and not self.use_prims_ts_nvfp4_decode
@@ -2053,8 +2061,8 @@ class FlashInferImpl(AttentionImpl):
         )
         self.cache_dtype = kv_cache_dtype
         self.physical_kvcache_nvfp4 = kv_cache_dtype.startswith("nvfp4")
-        self.use_prims_ts_nvfp4_decode = (
-            self.physical_kvcache_nvfp4 and head_size == 512
+        self.use_prims_ts_nvfp4_decode = _use_prims_ts_nvfp4_decode(
+            self.physical_kvcache_nvfp4, head_size
         )
         self.is_kvcache_nvfp4 = (
             self.physical_kvcache_nvfp4 and not self.use_prims_ts_nvfp4_decode

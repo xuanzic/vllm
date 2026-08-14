@@ -115,3 +115,23 @@ def test_prims_ts_max_kv_len_bucket():
     assert _prims_ts_max_kv_len_bucket(1, 64) == 64
     assert _prims_ts_max_kv_len_bucket(65, 64) == 128
     assert _prims_ts_max_kv_len_bucket(262144, 64) == 262144
+
+
+@pytest.mark.parametrize(
+    ("physical_nvfp4", "head_dim", "expected"),
+    [
+        (True, 256, True),
+        (True, 512, True),
+        (True, 128, False),
+        (False, 256, False),
+        (False, 512, False),
+    ],
+)
+def test_prims_ts_nvfp4_decode_selection(
+    physical_nvfp4: bool, head_dim: int, expected: bool
+):
+    from vllm.v1.attention.backends.flashinfer import (
+        _use_prims_ts_nvfp4_decode,
+    )
+
+    assert _use_prims_ts_nvfp4_decode(physical_nvfp4, head_dim) is expected
