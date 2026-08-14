@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+
 import pytest
 import torch
 
@@ -135,3 +137,14 @@ def test_prims_ts_nvfp4_decode_selection(
     )
 
     assert _use_prims_ts_nvfp4_decode(physical_nvfp4, head_dim) is expected
+
+
+def test_enable_prims_ts_nvfp4_aot_plan(monkeypatch):
+    from vllm.v1.attention.backends.flashinfer import (
+        _enable_prims_ts_nvfp4_aot_plan,
+    )
+
+    env_name = "FLASHINFER_PRIMS_TS_FORCE_DYNAMIC_PLAN"
+    monkeypatch.delenv(env_name, raising=False)
+    _enable_prims_ts_nvfp4_aot_plan()
+    assert os.environ[env_name] == "1"

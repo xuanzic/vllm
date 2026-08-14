@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
+import os
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
@@ -91,6 +92,8 @@ FP4_DTYPE = torch.uint8
 
 logger = init_logger(__name__)
 
+_PRIMS_TS_FORCE_DYNAMIC_PLAN_ENV = "FLASHINFER_PRIMS_TS_FORCE_DYNAMIC_PLAN"
+
 
 def _use_prims_ts_nvfp4_decode(
     physical_kvcache_nvfp4: bool, head_dim: int
@@ -98,6 +101,17 @@ def _use_prims_ts_nvfp4_decode(
     """Select mixed-precision prims+TS for supported NVFP4 head sizes."""
 
     return physical_kvcache_nvfp4 and head_dim in (256, 512)
+
+
+def _enable_prims_ts_nvfp4_aot_plan() -> None:
+    """Use AOT-stable decode metadata in this worker process.
+
+    Local data-parallel workers do not inherit arbitrary ``FLASHINFER_*``
+    environment variables from the API server.  Set the opt-in at the point
+    where each worker selects the physical-NVFP4 prims+TS route instead.
+    """
+
+    os.environ[_PRIMS_TS_FORCE_DYNAMIC_PLAN_ENV] = "1"
 
 
 def _prims_ts_max_kv_len_bucket(max_kv_len: int, page_size: int) -> int:
@@ -981,6 +995,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                             f"in {{16,32,64,128}}, got {self.page_size}."
                         )
                     _get_prims_ts_decode_wrapper_cls()
+                    _enable_prims_ts_nvfp4_aot_plan()
                 elif (
                     force_use_trtllm_attention() is False
                     or not supports_trtllm_attention(is_prefill=True)
