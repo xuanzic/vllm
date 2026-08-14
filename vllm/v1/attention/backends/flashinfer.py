@@ -1915,7 +1915,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         for request_idx, num_blocks in enumerate(decode_num_blocks)
                     ]
                 ).contiguous()
-                torch.cuda.current_stream().synchronize()
+
+                # Do not synchronize the producer stream here.  prims+TS
+                # plan() snapshots indptr and last-page metadata through its
+                # existing device-to-host read before deriving the launch
+                # policy, which already waits for these same-stream copies.
+                # An explicit synchronize adds a second host barrier to every
+                # decode plan without making the metadata any more current.
 
                 wrapper_cls = _get_prims_ts_decode_wrapper_cls()
                 planned_max_kv_len = _prims_ts_max_kv_len_bucket(
