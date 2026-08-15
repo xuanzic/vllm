@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -131,6 +131,36 @@ def _get_prims_ts_decode_wrapper_cls() -> type:
             "Gemma H512 NVFP4 KV requires FlashInfer prims+TS H512 support."
         ) from exc
     return BatchDecodePagedTSWrapper
+
+
+def _update_prims_ts_paged_kv_metadata(
+    wrapper: Any,
+    paged_kv_indptr: torch.Tensor,
+    paged_kv_indices: torch.Tensor,
+    paged_kv_last_page_len: torch.Tensor,
+) -> None:
+    """Update dynamic PrimTS metadata without replacing captured storage."""
+
+    if (
+        wrapper._kv_prefix_mode != "dynamic"
+        or wrapper._kv_lengths_mode != "dynamic"
+    ):
+        raise RuntimeError("CUDA graph metadata updates require a dynamic plan")
+    if paged_kv_indices.numel() > wrapper._paged_kv_indices.numel():
+        raise ValueError("paged-KV page IDs exceed the captured plan capacity")
+    wrapper._paged_kv_indptr.copy_(paged_kv_indptr)
+    wrapper._paged_kv_indices[: paged_kv_indices.numel()].copy_(
+        paged_kv_indices
+    )
+    wrapper._paged_kv_last_page_len.copy_(paged_kv_last_page_len)
+    torch.sub(
+        wrapper._paged_kv_indptr[1:],
+        wrapper._paged_kv_indptr[:-1],
+        out=wrapper._seq_lens,
+    )
+    wrapper._seq_lens.sub_(1).mul_(wrapper._page_size).add_(
+        wrapper._paged_kv_last_page_len
+    )
 
 
 class _NVFP4ContextMaterializeWorkspace:
@@ -902,7 +932,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             None  # Wrapper for non-causal prefill (DFlash)
         )
         self._decode_wrapper = None  # Wrapper for decode (general shape)
-        self._prims_ts_nvfp4_decode_wrappers: dict[int, object] = {}
+        self._prims_ts_nvfp4_decode_wrappers: dict[
+            tuple[int, int | None], object
+        ] = {}
+        self._prims_ts_nvfp4_graph_metadata: dict[
+            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
 
         if envs.VLLM_BATCH_INVARIANT:
             self.decode_fixed_split_size = 2048
@@ -920,6 +955,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         max_num_pages_per_req = cdiv(
             self.model_config.max_model_len, self.kv_cache_spec.block_size
         )
+        self.max_num_pages_per_req = max_num_pages_per_req
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.max_num_reqs = max_num_reqs
         max_num_pages = max_num_reqs * max_num_pages_per_req
@@ -1915,39 +1951,113 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         for request_idx, num_blocks in enumerate(decode_num_blocks)
                     ]
                 ).contiguous()
-
-                # Do not synchronize the producer stream here.  prims+TS
-                # plan() snapshots indptr and last-page metadata through its
-                # existing device-to-host read before deriving the launch
-                # policy, which already waits for these same-stream copies.
-                # An explicit synchronize adds a second host barrier to every
-                # decode plan without making the metadata any more current.
-
                 wrapper_cls = _get_prims_ts_decode_wrapper_cls()
                 planned_max_kv_len = _prims_ts_max_kv_len_bucket(
                     max_seq_len, self.page_size
                 )
+                use_cudagraph = (
+                    self.enable_cuda_graph
+                    and num_prefills == 0
+                    and num_decode_tokens <= self._decode_cudagraph_max_bs
+                )
+                if use_cudagraph:
+                    persistent_metadata = self._prims_ts_nvfp4_graph_metadata.get(
+                        num_decodes
+                    )
+                    if persistent_metadata is None:
+                        page_capacity = (
+                            num_decodes * self.max_num_pages_per_req
+                        )
+                        persistent_indptr = torch.arange(
+                            0,
+                            page_capacity + 1,
+                            self.max_num_pages_per_req,
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                        persistent_indices = torch.zeros(
+                            page_capacity, dtype=torch.int32, device=self.device
+                        )
+                        persistent_last_page_len = torch.full(
+                            (num_decodes,),
+                            self.page_size,
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                        persistent_metadata = (
+                            persistent_indptr,
+                            persistent_indices,
+                            persistent_last_page_len,
+                        )
+                        self._prims_ts_nvfp4_graph_metadata[num_decodes] = (
+                            persistent_metadata
+                        )
                 wrappers_by_window_left: dict[int, object] = {}
                 for window_left in self.prims_ts_window_lefts:
-                    wrapper = self._prims_ts_nvfp4_decode_wrappers.get(window_left)
+                    wrapper_key = (
+                        window_left,
+                        num_decodes if use_cudagraph else None,
+                    )
+                    wrapper = self._prims_ts_nvfp4_decode_wrappers.get(wrapper_key)
                     if wrapper is None:
                         wrapper = wrapper_cls(kv_layout="HND")
-                        self._prims_ts_nvfp4_decode_wrappers[window_left] = wrapper
-                    wrapper.plan(
-                        paged_kv_indptr_decode,
-                        paged_kv_indices_decode,
-                        paged_kv_last_page_len_decode,
-                        self.num_qo_heads,
-                        self.num_kv_heads,
-                        self.head_dim,
-                        self.page_size,
-                        q_data_type=self.q_data_type_decode,
-                        kv_data_type=torch.uint8,
-                        o_data_type=FP8_DTYPE,
-                        mask_type="causal" if window_left >= 0 else "dense",
-                        window_left=window_left,
-                        max_kv_len=planned_max_kv_len,
-                    )
+                        self._prims_ts_nvfp4_decode_wrappers[wrapper_key] = wrapper
+                        plan_metadata = (
+                            persistent_metadata
+                            if use_cudagraph
+                            else (
+                                paged_kv_indptr_decode,
+                                paged_kv_indices_decode,
+                                paged_kv_last_page_len_decode,
+                            )
+                        )
+                        wrapper.plan(
+                            *plan_metadata,
+                            self.num_qo_heads,
+                            self.num_kv_heads,
+                            self.head_dim,
+                            self.page_size,
+                            q_data_type=self.q_data_type_decode,
+                            kv_data_type=torch.uint8,
+                            o_data_type=FP8_DTYPE,
+                            mask_type=(
+                                "causal" if window_left >= 0 else "dense"
+                            ),
+                            window_left=window_left,
+                            max_kv_len=(
+                                _prims_ts_max_kv_len_bucket(
+                                    self.model_config.max_model_len,
+                                    self.page_size,
+                                )
+                                if use_cudagraph
+                                else planned_max_kv_len
+                            ),
+                        )
+                    elif not use_cudagraph:
+                        wrapper.plan(
+                            paged_kv_indptr_decode,
+                            paged_kv_indices_decode,
+                            paged_kv_last_page_len_decode,
+                            self.num_qo_heads,
+                            self.num_kv_heads,
+                            self.head_dim,
+                            self.page_size,
+                            q_data_type=self.q_data_type_decode,
+                            kv_data_type=torch.uint8,
+                            o_data_type=FP8_DTYPE,
+                            mask_type=(
+                                "causal" if window_left >= 0 else "dense"
+                            ),
+                            window_left=window_left,
+                            max_kv_len=planned_max_kv_len,
+                        )
+                    if use_cudagraph:
+                        _update_prims_ts_paged_kv_metadata(
+                            wrapper,
+                            paged_kv_indptr_decode,
+                            paged_kv_indices_decode,
+                            paged_kv_last_page_len_decode,
+                        )
                     wrappers_by_window_left[window_left] = wrapper
                 attn_metadata.decode = PrimsTSNVFP4Decode(
                     wrappers_by_window_left=wrappers_by_window_left

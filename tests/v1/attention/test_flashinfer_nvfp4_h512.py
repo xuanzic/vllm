@@ -119,6 +119,52 @@ def test_prims_ts_max_kv_len_bucket():
     assert _prims_ts_max_kv_len_bucket(262144, 64) == 262144
 
 
+def test_update_prims_ts_paged_kv_metadata_preserves_storage():
+    from vllm.v1.attention.backends.flashinfer import (
+        _update_prims_ts_paged_kv_metadata,
+    )
+
+    class Wrapper:
+        _kv_prefix_mode = "dynamic"
+        _kv_lengths_mode = "dynamic"
+        _page_size = 64
+        _paged_kv_indptr = torch.empty(3, dtype=torch.int32)
+        _paged_kv_indices = torch.empty(8, dtype=torch.int32)
+        _paged_kv_last_page_len = torch.empty(2, dtype=torch.int32)
+        _seq_lens = torch.empty(2, dtype=torch.int32)
+
+    wrapper = Wrapper()
+    addresses = (
+        wrapper._paged_kv_indptr.data_ptr(),
+        wrapper._paged_kv_indices.data_ptr(),
+        wrapper._paged_kv_last_page_len.data_ptr(),
+        wrapper._seq_lens.data_ptr(),
+    )
+    _update_prims_ts_paged_kv_metadata(
+        wrapper,
+        torch.tensor([0, 2, 5], dtype=torch.int32),
+        torch.tensor([7, 3, 9, 4, 1], dtype=torch.int32),
+        torch.tensor([32, 17], dtype=torch.int32),
+    )
+
+    assert addresses == (
+        wrapper._paged_kv_indptr.data_ptr(),
+        wrapper._paged_kv_indices.data_ptr(),
+        wrapper._paged_kv_last_page_len.data_ptr(),
+        wrapper._seq_lens.data_ptr(),
+    )
+    torch.testing.assert_close(
+        wrapper._paged_kv_indptr, torch.tensor([0, 2, 5], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        wrapper._paged_kv_indices[:5],
+        torch.tensor([7, 3, 9, 4, 1], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        wrapper._seq_lens, torch.tensor([96, 145], dtype=torch.int32)
+    )
+
+
 @pytest.mark.parametrize(
     ("physical_nvfp4", "head_dim", "expected"),
     [
