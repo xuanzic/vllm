@@ -175,6 +175,76 @@ def _update_prims_ts_paged_kv_metadata(
         ).synchronize()
 
 
+def _prepare_prims_ts_decode_metadata(
+    decode_num_blocks: list[int],
+    paged_kv_indptr: torch.Tensor,
+    paged_kv_indices: torch.Tensor,
+    paged_kv_last_page_len: torch.Tensor,
+    paged_kv_last_page_len_values: np.ndarray,
+    block_table_tensor: torch.Tensor,
+    *,
+    reuse_existing: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return PrimTS metadata, adding a valid page for padded rows.
+
+    CUDA graph replay can reuse the GPU metadata that the common builder just
+    produced. A dynamic plan may read indptr on the host immediately, so it
+    keeps the materialized path to avoid observing an outstanding async copy.
+    """
+
+    real_request_idx = next(
+        (
+            request_idx
+            for request_idx, num_blocks in enumerate(decode_num_blocks)
+            if num_blocks > 0
+        ),
+        None,
+    )
+    if real_request_idx is None:
+        raise ValueError(
+            "PrimTS NVFP4 decode received no request with a KV page: "
+            f"{decode_num_blocks}"
+        )
+
+    num_decodes = len(decode_num_blocks)
+    # CUDA graph batch buckets may append zero-length rows. PrimTS requires a
+    # valid page for each row, so only an unpadded batch can reuse these views.
+    if reuse_existing and all(num_blocks > 0 for num_blocks in decode_num_blocks):
+        num_decode_pages = sum(decode_num_blocks)
+        return (
+            paged_kv_indptr[: num_decodes + 1],
+            paged_kv_indices[:num_decode_pages],
+            paged_kv_last_page_len[:num_decodes],
+        )
+
+    planned_num_blocks = [max(1, value) for value in decode_num_blocks]
+    indptr_values = np.empty(num_decodes + 1, dtype=np.int32)
+    indptr_values[0] = 0
+    np.cumsum(planned_num_blocks, dtype=np.int32, out=indptr_values[1:])
+    padded_indptr = torch.tensor(
+        indptr_values, dtype=torch.int32, device=block_table_tensor.device
+    )
+    last_page_len_values = paged_kv_last_page_len_values[:num_decodes].copy()
+    last_page_len_values[np.asarray(decode_num_blocks) == 0] = 1
+    padded_last_page_len = torch.tensor(
+        last_page_len_values,
+        dtype=torch.int32,
+        device=block_table_tensor.device,
+    )
+    dummy_page = block_table_tensor[real_request_idx, :1]
+    padded_indices = torch.cat(
+        [
+            (
+                block_table_tensor[request_idx, :num_blocks]
+                if num_blocks > 0
+                else dummy_page
+            )
+            for request_idx, num_blocks in enumerate(decode_num_blocks)
+        ]
+    ).contiguous()
+    return padded_indptr, padded_indices, padded_last_page_len
+
+
 class _NVFP4ContextMaterializeWorkspace:
     """Grow-only per-stream buffers shared by sequential attention layers."""
 
@@ -1921,56 +1991,27 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 assert paged_kv_indices is not None
                 assert num_blocks_np is not None
                 decode_num_blocks = num_blocks_np[:num_decodes].tolist()
-                real_request_idx = next(
-                    (
-                        request_idx
-                        for request_idx, num_blocks in enumerate(decode_num_blocks)
-                        if num_blocks > 0
-                    ),
-                    None,
-                )
-                if real_request_idx is None:
-                    raise ValueError(
-                        "H512 prims+TS NVFP4 decode received no request with a "
-                        f"KV page: {decode_num_blocks}"
-                    )
-
-                # CUDA graph capture can pad the active batch with zero-length
-                # rows. prims+TS requires at least one valid page per row, so
-                # point only those ignored rows at a page from a real request.
-                planned_num_blocks = [max(1, value) for value in decode_num_blocks]
-                indptr_values = np.empty(num_decodes + 1, dtype=np.int32)
-                indptr_values[0] = 0
-                np.cumsum(planned_num_blocks, dtype=np.int32, out=indptr_values[1:])
-                paged_kv_indptr_decode = torch.tensor(
-                    indptr_values, dtype=torch.int32, device=self.device
-                )
-                last_page_len_values = self.paged_kv_last_page_len.np[
-                    :num_decodes
-                ].copy()
-                last_page_len_values[np.asarray(decode_num_blocks) == 0] = 1
-                paged_kv_last_page_len_decode = torch.tensor(
-                    last_page_len_values, dtype=torch.int32, device=self.device
-                )
-                dummy_page = block_table_tensor[real_request_idx, :1]
-                paged_kv_indices_decode = torch.cat(
-                    [
-                        (
-                            block_table_tensor[request_idx, :num_blocks]
-                            if num_blocks > 0
-                            else dummy_page
-                        )
-                        for request_idx, num_blocks in enumerate(decode_num_blocks)
-                    ]
-                ).contiguous()
-                wrapper_cls = _get_prims_ts_decode_wrapper_cls()
-                planned_max_kv_len = _prims_ts_max_kv_len_bucket(
-                    max_seq_len, self.page_size
-                )
                 use_cudagraph = (
                     self.enable_cuda_graph
                     and num_prefills == 0
                     and num_decode_tokens <= self._decode_cudagraph_max_bs
+                )
+                (
+                    paged_kv_indptr_decode,
+                    paged_kv_indices_decode,
+                    paged_kv_last_page_len_decode,
+                ) = _prepare_prims_ts_decode_metadata(
+                    decode_num_blocks,
+                    self.paged_kv_indptr.gpu,
+                    paged_kv_indices,
+                    self.paged_kv_last_page_len.gpu,
+                    self.paged_kv_last_page_len.np,
+                    block_table_tensor,
+                    reuse_existing=use_cudagraph,
+                )
+                wrapper_cls = _get_prims_ts_decode_wrapper_cls()
+                planned_max_kv_len = _prims_ts_max_kv_len_bucket(
+                    max_seq_len, self.page_size
                 )
                 if use_cudagraph:
                     persistent_metadata = self._prims_ts_nvfp4_graph_metadata.get(

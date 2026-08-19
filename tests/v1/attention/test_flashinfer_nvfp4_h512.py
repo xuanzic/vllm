@@ -2,6 +2,7 @@
 
 import os
 
+import numpy as np
 import pytest
 import torch
 
@@ -117,6 +118,113 @@ def test_prims_ts_max_kv_len_bucket():
     assert _prims_ts_max_kv_len_bucket(1, 64) == 64
     assert _prims_ts_max_kv_len_bucket(65, 64) == 128
     assert _prims_ts_max_kv_len_bucket(262144, 64) == 262144
+
+
+def test_prepare_prims_ts_decode_metadata_reuses_unpadded_storage():
+    from vllm.v1.attention.backends.flashinfer import (
+        _prepare_prims_ts_decode_metadata,
+    )
+
+    indptr = torch.tensor([0, 2, 5, 6], dtype=torch.int32)
+    indices = torch.tensor([3, 7, 5, 9, 11, 13], dtype=torch.int32)
+    last_page_len = torch.tensor([32, 17, 8], dtype=torch.int32)
+    block_tables = torch.tensor(
+        [[3, 7, 0], [5, 9, 11], [13, 0, 0]], dtype=torch.int32
+    )
+
+    decode_indptr, decode_indices, decode_last_page_len = (
+        _prepare_prims_ts_decode_metadata(
+            [2, 3],
+            indptr,
+            indices,
+            last_page_len,
+            last_page_len.numpy(),
+            block_tables,
+            reuse_existing=True,
+        )
+    )
+
+    assert decode_indptr.data_ptr() == indptr.data_ptr()
+    assert decode_indices.data_ptr() == indices.data_ptr()
+    assert decode_last_page_len.data_ptr() == last_page_len.data_ptr()
+    torch.testing.assert_close(
+        decode_indptr, torch.tensor([0, 2, 5], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        decode_indices, torch.tensor([3, 7, 5, 9, 11], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        decode_last_page_len, torch.tensor([32, 17], dtype=torch.int32)
+    )
+
+
+def test_prepare_prims_ts_decode_metadata_pads_empty_rows():
+    from vllm.v1.attention.backends.flashinfer import (
+        _prepare_prims_ts_decode_metadata,
+    )
+
+    indptr = torch.tensor([0, 2, 2], dtype=torch.int32)
+    indices = torch.tensor([3, 7], dtype=torch.int32)
+    last_page_len = torch.tensor([32, 0], dtype=torch.int32)
+    block_tables = torch.tensor([[3, 7], [0, 0]], dtype=torch.int32)
+
+    decode_indptr, decode_indices, decode_last_page_len = (
+        _prepare_prims_ts_decode_metadata(
+            [2, 0],
+            indptr,
+            indices,
+            last_page_len,
+            np.array([32, 0], dtype=np.int32),
+            block_tables,
+            reuse_existing=True,
+        )
+    )
+
+    torch.testing.assert_close(
+        decode_indptr, torch.tensor([0, 2, 3], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        decode_indices, torch.tensor([3, 7, 3], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        decode_last_page_len, torch.tensor([32, 1], dtype=torch.int32)
+    )
+
+
+def test_prepare_prims_ts_decode_metadata_materializes_for_dynamic_plan():
+    from vllm.v1.attention.backends.flashinfer import (
+        _prepare_prims_ts_decode_metadata,
+    )
+
+    indptr = torch.tensor([0, 2], dtype=torch.int32)
+    indices = torch.tensor([3, 7], dtype=torch.int32)
+    last_page_len = torch.tensor([32], dtype=torch.int32)
+    block_tables = torch.tensor([[3, 7]], dtype=torch.int32)
+
+    decode_indptr, decode_indices, decode_last_page_len = (
+        _prepare_prims_ts_decode_metadata(
+            [2],
+            indptr,
+            indices,
+            last_page_len,
+            np.array([32], dtype=np.int32),
+            block_tables,
+            reuse_existing=False,
+        )
+    )
+
+    assert decode_indptr.data_ptr() != indptr.data_ptr()
+    assert decode_indices.data_ptr() != indices.data_ptr()
+    assert decode_last_page_len.data_ptr() != last_page_len.data_ptr()
+    torch.testing.assert_close(
+        decode_indptr, torch.tensor([0, 2], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        decode_indices, torch.tensor([3, 7], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        decode_last_page_len, torch.tensor([32], dtype=torch.int32)
+    )
 
 
 def test_update_prims_ts_paged_kv_metadata_preserves_storage():
