@@ -2072,7 +2072,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                             self.page_size,
                             q_data_type=self.q_data_type_decode,
                             kv_data_type=torch.uint8,
-                            o_data_type=FP8_DTYPE,
+                            o_data_type=self.model_config.dtype,
                             mask_type=(
                                 "causal" if window_left >= 0 else "dense"
                             ),
@@ -2097,7 +2097,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                             self.page_size,
                             q_data_type=self.q_data_type_decode,
                             kv_data_type=torch.uint8,
-                            o_data_type=FP8_DTYPE,
+                            o_data_type=self.model_config.dtype,
                             mask_type=(
                                 "causal" if window_left >= 0 else "dense"
                             ),
@@ -2823,8 +2823,7 @@ class FlashInferImpl(AttentionImpl):
                 decode_query = canonicalize_singleton_dim_strides(
                     decode_query.contiguous()
                 )
-                assert self._nvfp4_fp8_out is not None
-                out_decode = self._nvfp4_fp8_out[:num_decode_tokens]
+                out_decode = output[:num_decode_tokens]
                 wrapper = attn_metadata.decode.wrappers_by_window_left.get(
                     self.window_left
                 )
@@ -2843,10 +2842,6 @@ class FlashInferImpl(AttentionImpl):
                     bmm2_scale=layer._v_scale_float,
                     out=out_decode,
                 )
-                if output.dtype == FP8_DTYPE:
-                    output[:num_decode_tokens].copy_(out_decode)
-                else:
-                    output[:num_decode_tokens].copy_(out_decode.to(output.dtype))
             elif not decode_with_flashinfer_trtllm_api:
                 assert isinstance(attn_metadata.decode, FIDecode)
                 decode_wrapper = attn_metadata.decode.wrapper
