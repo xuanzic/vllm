@@ -161,18 +161,9 @@ def _update_prims_ts_paged_kv_metadata(
     wrapper._seq_lens.sub_(1).mul_(wrapper._page_size).add_(
         wrapper._paged_kv_last_page_len
     )
-    # The persistent buffers are consumed by FULL CUDA graph replay. Unlike
-    # the old per-step plan(), this update has no device-to-host metadata read
-    # to wait for the async writes. Finish the producer stream before replay;
-    # otherwise a padded multi-request graph can observe stale page metadata.
-    # Synchronizing during capture is both unnecessary and unsupported.
-    if (
-        wrapper._paged_kv_indptr.is_cuda
-        and not torch.cuda.is_current_stream_capturing()
-    ):
-        torch.cuda.current_stream(
-            wrapper._paged_kv_indptr.device
-        ).synchronize()
+    # Metadata writes and full-graph replay use the same compute stream, so
+    # stream ordering makes them visible without a host-side synchronize.
+    # Synchronizing here serializes short decode iterations.
 
 
 def _prepare_prims_ts_decode_metadata(
