@@ -166,6 +166,63 @@ def _update_prims_ts_paged_kv_metadata(
     # Synchronizing here serializes short decode iterations.
 
 
+def _update_prims_ts_capacity_paged_kv_metadata(
+    wrapper: Any,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+) -> None:
+    """Update graph metadata on-device using fixed-capacity CSR rows.
+
+    PrimTS only visits pages covered by ``seq_lens``.  CUDA-graph wrappers can
+    therefore keep a fixed row stride equal to the block-table capacity instead
+    of compacting every row on the host.  This avoids reading sequence lengths
+    back to the CPU at each decode step.
+    """
+
+    if (
+        wrapper._kv_prefix_mode != "dynamic"
+        or wrapper._kv_lengths_mode != "dynamic"
+    ):
+        raise RuntimeError("CUDA graph metadata updates require a dynamic plan")
+
+    batch_size = wrapper._batch_size
+    if block_tables.ndim != 2 or block_tables.shape[0] != batch_size:
+        raise ValueError(
+            "PrimTS capacity metadata requires one block-table row per "
+            f"planned request, got {tuple(block_tables.shape)} for batch "
+            f"size {batch_size}."
+        )
+    if seq_lens.ndim != 1 or seq_lens.shape[0] != batch_size:
+        raise ValueError(
+            "PrimTS capacity metadata requires one sequence length per "
+            f"planned request, got {tuple(seq_lens.shape)} for batch size "
+            f"{batch_size}."
+        )
+
+    indices = wrapper._paged_kv_indices
+    if indices.numel() % batch_size != 0:
+        raise ValueError("PrimTS paged-KV index capacity is not batch aligned")
+    pages_per_request = indices.numel() // batch_size
+    if block_tables.shape[1] != pages_per_request:
+        raise ValueError(
+            "PrimTS block-table width must match the captured page capacity: "
+            f"got {block_tables.shape[1]} and {pages_per_request}."
+        )
+
+    capacity_indices = indices.view(batch_size, pages_per_request)
+    capacity_indices.copy_(block_tables)
+
+    # CUDA graphs may pad the batch with zero-length rows.  Give those ignored
+    # rows one valid token and point their first page at request zero's page so
+    # the kernel never dereferences an invalid padded block-table entry.
+    safe_seq_lens = torch.clamp(seq_lens, min=1)
+    wrapper._seq_lens.copy_(safe_seq_lens)
+    first_pages = capacity_indices[:, 0]
+    first_pages.copy_(
+        torch.where(seq_lens > 0, first_pages, first_pages[:1])
+    )
+
+
 def _prepare_prims_ts_decode_metadata(
     decode_num_blocks: list[int],
     paged_kv_indptr: torch.Tensor,
@@ -1665,6 +1722,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             causal or self.use_dedicated_xqa
         )
         decode_with_prims_ts_nvfp4 = causal and self.use_prims_ts_nvfp4_decode
+        prims_ts_cudagraph_decode = (
+            decode_with_prims_ts_nvfp4
+            and self.enable_cuda_graph
+            and num_prefills == 0
+            and num_decode_tokens <= self._decode_cudagraph_max_bs
+        )
 
         if not causal and self.use_dcp:
             raise NotImplementedError(
@@ -1734,7 +1797,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         needs_seq_lens_cpu = (
             self.use_dcp
             or use_cascade
-            or decode_with_prims_ts_nvfp4
+            or (decode_with_prims_ts_nvfp4 and not prims_ts_cudagraph_decode)
             or not all_uses_specialized_attention
         )
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu if needs_seq_lens_cpu else None
@@ -1780,8 +1843,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         needs_native_paged_decode = (
             num_decodes > 0
             and (
-                not decode_with_flashinfer_trtllm_api
-                or decode_with_prims_ts_nvfp4
+                (
+                    decode_with_prims_ts_nvfp4
+                    and not prims_ts_cudagraph_decode
+                )
+                or (
+                    not decode_with_prims_ts_nvfp4
+                    and not decode_with_flashinfer_trtllm_api
+                )
             )
         )
         needs_paged_kv_indices = (
@@ -1979,27 +2048,24 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         "The H512 prims+TS NVFP4 decode route currently supports "
                         "single-token decode only."
                     )
-                assert paged_kv_indices is not None
-                assert num_blocks_np is not None
-                decode_num_blocks = num_blocks_np[:num_decodes].tolist()
-                use_cudagraph = (
-                    self.enable_cuda_graph
-                    and num_prefills == 0
-                    and num_decode_tokens <= self._decode_cudagraph_max_bs
-                )
-                (
-                    paged_kv_indptr_decode,
-                    paged_kv_indices_decode,
-                    paged_kv_last_page_len_decode,
-                ) = _prepare_prims_ts_decode_metadata(
-                    decode_num_blocks,
-                    self.paged_kv_indptr.gpu,
-                    paged_kv_indices,
-                    self.paged_kv_last_page_len.gpu,
-                    self.paged_kv_last_page_len.np,
-                    block_table_tensor,
-                    reuse_existing=use_cudagraph,
-                )
+                use_cudagraph = prims_ts_cudagraph_decode
+                if not use_cudagraph:
+                    assert paged_kv_indices is not None
+                    assert num_blocks_np is not None
+                    decode_num_blocks = num_blocks_np[:num_decodes].tolist()
+                    (
+                        paged_kv_indptr_decode,
+                        paged_kv_indices_decode,
+                        paged_kv_last_page_len_decode,
+                    ) = _prepare_prims_ts_decode_metadata(
+                        decode_num_blocks,
+                        self.paged_kv_indptr.gpu,
+                        paged_kv_indices,
+                        self.paged_kv_last_page_len.gpu,
+                        self.paged_kv_last_page_len.np,
+                        block_table_tensor,
+                        reuse_existing=False,
+                    )
                 wrapper_cls = _get_prims_ts_decode_wrapper_cls()
                 planned_max_kv_len = _prims_ts_max_kv_len_bucket(
                     max_seq_len, self.page_size
@@ -2096,11 +2162,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                             max_kv_len=planned_max_kv_len,
                         )
                     if use_cudagraph:
-                        _update_prims_ts_paged_kv_metadata(
+                        _update_prims_ts_capacity_paged_kv_metadata(
                             wrapper,
-                            paged_kv_indptr_decode,
-                            paged_kv_indices_decode,
-                            paged_kv_last_page_len_decode,
+                            block_table_tensor[:num_decodes],
+                            seq_lens[:num_decodes],
                         )
                     wrappers_by_window_left[window_left] = wrapper
                 attn_metadata.decode = PrimsTSNVFP4Decode(
