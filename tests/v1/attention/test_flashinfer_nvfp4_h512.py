@@ -120,6 +120,57 @@ def test_prims_ts_max_kv_len_bucket():
     assert _prims_ts_max_kv_len_bucket(262144, 64) == 262144
 
 
+@pytest.mark.parametrize(
+    ("qo_indptr", "num_decode_tokens", "allow_zero_padding", "expected"),
+    [
+        ([0, 1, 2], 2, False, 1),
+        ([0, 4, 8], 8, False, 4),
+        ([0, 4, 8, 8], 12, True, 4),
+    ],
+)
+def test_get_uniform_prims_ts_decode_query_len(
+    qo_indptr, num_decode_tokens, allow_zero_padding, expected
+):
+    from vllm.v1.attention.backends.flashinfer import (
+        _get_uniform_prims_ts_decode_query_len,
+    )
+
+    assert (
+        _get_uniform_prims_ts_decode_query_len(
+            torch.tensor(qo_indptr, dtype=torch.int32),
+            len(qo_indptr) - 1,
+            num_decode_tokens,
+            allow_zero_padding=allow_zero_padding,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("qo_indptr", "num_decode_tokens", "allow_zero_padding"),
+    [
+        ([0, 4, 8, 8], 12, False),
+        ([0, 4, 6], 6, False),
+        ([0, 4, 6], 6, True),
+        ([0, 4, 8], 7, False),
+    ],
+)
+def test_get_uniform_prims_ts_decode_query_len_rejects_unsupported_shapes(
+    qo_indptr, num_decode_tokens, allow_zero_padding
+):
+    from vllm.v1.attention.backends.flashinfer import (
+        _get_uniform_prims_ts_decode_query_len,
+    )
+
+    with pytest.raises(NotImplementedError):
+        _get_uniform_prims_ts_decode_query_len(
+            torch.tensor(qo_indptr, dtype=torch.int32),
+            len(qo_indptr) - 1,
+            num_decode_tokens,
+            allow_zero_padding=allow_zero_padding,
+        )
+
+
 def test_prepare_prims_ts_decode_metadata_reuses_unpadded_storage():
     from vllm.v1.attention.backends.flashinfer import (
         _prepare_prims_ts_decode_metadata,

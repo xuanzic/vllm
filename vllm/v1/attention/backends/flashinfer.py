@@ -123,6 +123,44 @@ def _prims_ts_max_kv_len_bucket(max_kv_len: int, page_size: int) -> int:
     return max(page_size, 1 << (max_kv_len - 1).bit_length())
 
 
+def _get_uniform_prims_ts_decode_query_len(
+    qo_indptr_cpu: torch.Tensor,
+    num_decodes: int,
+    num_decode_tokens: int,
+    *,
+    allow_zero_padding: bool,
+) -> int:
+    """Return the fixed query width required by a PrimTS decode module.
+
+    Full CUDA graphs pad a captured request bucket with inactive rows. Those
+    rows have zero query length, while the static query/output tensors retain
+    the captured ``[batch, query_len, ...]`` capacity. Active rows must still
+    have one common query length; genuinely ragged speculative batches are not
+    accepted by the fixed-shape PrimTS wrapper.
+    """
+    if num_decodes <= 0 or num_decode_tokens <= 0:
+        raise ValueError("PrimTS decode requires at least one request and token")
+    if num_decode_tokens % num_decodes != 0:
+        raise NotImplementedError(
+            "The prims+TS NVFP4 decode route requires a uniform query length "
+            "per request."
+        )
+
+    q_len_per_req = num_decode_tokens // num_decodes
+    decode_q_lens = qo_indptr_cpu[1 : num_decodes + 1] - qo_indptr_cpu[:num_decodes]
+    valid = decode_q_lens == q_len_per_req
+    if allow_zero_padding:
+        valid |= decode_q_lens == 0
+    if not bool(valid.all().item()):
+        raise NotImplementedError(
+            "The prims+TS NVFP4 decode route does not yet support ragged "
+            "speculative query lengths. "
+            f"Got {num_decodes=}, {num_decode_tokens=}, {q_len_per_req=}, "
+            f"query_lens={decode_q_lens.tolist()}."
+        )
+    return q_len_per_req
+
+
 def _get_prims_ts_decode_wrapper_cls() -> type:
     try:
         from flashinfer.attention.prims_ts.decode import BatchDecodePagedTSWrapper
@@ -928,6 +966,8 @@ class PrimsTSNVFP4Decode:
     """Metadata for physical-NVFP4 prims+TS decode."""
 
     wrappers_by_window_left: dict[int, object]
+    num_decodes: int
+    q_len_per_req: int
 
 
 class FlashInferDecodeKernel(Enum):
@@ -1063,7 +1103,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         )
         self._decode_wrapper = None  # Wrapper for decode (general shape)
         self._prims_ts_nvfp4_decode_wrappers: dict[
-            tuple[int, int | None], object
+            tuple[int, int | None, int], object
         ] = {}
         self._prims_ts_nvfp4_graph_metadata: dict[
             int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
@@ -1231,7 +1271,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             and self.flashinfer_trtllm_api_decode_kernel == FlashInferDecodeKernel.XQA
         )
         supports_spec_as_decode = (
-            self.flashinfer_trtllm_api_decode_kernel
+            self.use_prims_ts_nvfp4_decode
+            or self.flashinfer_trtllm_api_decode_kernel
             == FlashInferDecodeKernel.TRTLLM_GEN
             or self.use_dedicated_xqa
         )
@@ -2043,11 +2084,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         "The H512 prims+TS NVFP4 decode route does not support "
                         "decode context parallelism."
                     )
-                if num_decode_tokens != num_decodes:
-                    raise NotImplementedError(
-                        "The H512 prims+TS NVFP4 decode route currently supports "
-                        "single-token decode only."
-                    )
+                q_len_per_req = _get_uniform_prims_ts_decode_query_len(
+                    qo_indptr_cpu,
+                    num_decodes,
+                    num_decode_tokens,
+                    allow_zero_padding=prims_ts_cudagraph_decode,
+                )
                 use_cudagraph = prims_ts_cudagraph_decode
                 if not use_cudagraph:
                     assert paged_kv_indices is not None
@@ -2107,6 +2149,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     wrapper_key = (
                         window_left,
                         num_decodes if use_cudagraph else None,
+                        q_len_per_req,
                     )
                     wrapper = self._prims_ts_nvfp4_decode_wrappers.get(wrapper_key)
                     if wrapper is None:
@@ -2127,11 +2170,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                             self.num_kv_heads,
                             self.head_dim,
                             self.page_size,
+                            seq_len_q=q_len_per_req,
                             q_data_type=self.q_data_type_decode,
                             kv_data_type=torch.uint8,
                             o_data_type=self.model_config.dtype,
                             mask_type=(
-                                "causal" if window_left >= 0 else "dense"
+                                "causal"
+                                if window_left >= 0 or q_len_per_req > 1
+                                else "dense"
                             ),
                             window_left=window_left,
                             max_kv_len=(
@@ -2152,11 +2198,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                             self.num_kv_heads,
                             self.head_dim,
                             self.page_size,
+                            seq_len_q=q_len_per_req,
                             q_data_type=self.q_data_type_decode,
                             kv_data_type=torch.uint8,
                             o_data_type=self.model_config.dtype,
                             mask_type=(
-                                "causal" if window_left >= 0 else "dense"
+                                "causal"
+                                if window_left >= 0 or q_len_per_req > 1
+                                else "dense"
                             ),
                             window_left=window_left,
                             max_kv_len=planned_max_kv_len,
@@ -2169,7 +2218,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         )
                     wrappers_by_window_left[window_left] = wrapper
                 attn_metadata.decode = PrimsTSNVFP4Decode(
-                    wrappers_by_window_left=wrappers_by_window_left
+                    wrappers_by_window_left=wrappers_by_window_left,
+                    num_decodes=num_decodes,
+                    q_len_per_req=q_len_per_req,
                 )
             elif decode_with_flashinfer_trtllm_api:
                 assert self.flashinfer_trtllm_api_decode_kernel is not None
@@ -2880,6 +2931,19 @@ class FlashInferImpl(AttentionImpl):
                     decode_query.contiguous()
                 )
                 out_decode = output[:num_decode_tokens]
+                if attn_metadata.decode.q_len_per_req > 1:
+                    decode_query = decode_query.view(
+                        attn_metadata.decode.num_decodes,
+                        attn_metadata.decode.q_len_per_req,
+                        self.num_heads,
+                        self.head_size,
+                    )
+                    out_decode = out_decode.view(
+                        attn_metadata.decode.num_decodes,
+                        attn_metadata.decode.q_len_per_req,
+                        self.num_heads,
+                        self.head_size,
+                    )
                 wrapper = attn_metadata.decode.wrappers_by_window_left.get(
                     self.window_left
                 )

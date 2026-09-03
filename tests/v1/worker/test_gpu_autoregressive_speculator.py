@@ -442,3 +442,49 @@ def test_update_draft_decode_metadata_skips_without_scheduler_metadata(monkeypat
 
     assert not called
     assert metadata.scheduler_metadata is None
+
+
+def test_gemma4_speculator_keeps_draft_decode_eager(monkeypatch):
+    from vllm.v1.worker.gpu.spec_decode.gemma4.speculator import (
+        Gemma4Speculator,
+    )
+
+    modes = []
+    monkeypatch.setattr(
+        AutoRegressiveSpeculator,
+        "init_cudagraph_manager",
+        lambda _self, mode: modes.append(mode),
+    )
+
+    speculator = object.__new__(Gemma4Speculator)
+    speculator.init_cudagraph_manager(CUDAGraphMode.FULL)
+
+    assert modes == [CUDAGraphMode.NONE]
+
+
+def test_gemma4_speculator_copies_target_kv_scales_without_aliasing():
+    from vllm.v1.worker.gpu.spec_decode.gemma4.speculator import (
+        _copy_target_kv_scales,
+    )
+
+    draft_attn = torch.nn.Module()
+    target_attn = torch.nn.Module()
+    for prefix, value in (("k", 0.25), ("v", 0.5)):
+        draft_attn.register_buffer(f"_{prefix}_scale", torch.tensor([1.0]))
+        target_attn.register_buffer(f"_{prefix}_scale", torch.tensor([value]))
+        setattr(draft_attn, f"_{prefix}_scale_float", 1.0)
+        setattr(target_attn, f"_{prefix}_scale_float", value)
+        setattr(draft_attn, f"_{prefix}_scale_cpu", torch.tensor(1.0))
+        setattr(target_attn, f"_{prefix}_scale_cpu", torch.tensor(value))
+
+    _copy_target_kv_scales(draft_attn, target_attn)
+
+    for prefix, value in (("k", 0.25), ("v", 0.5)):
+        draft_scale = getattr(draft_attn, f"_{prefix}_scale")
+        target_scale = getattr(target_attn, f"_{prefix}_scale")
+        torch.testing.assert_close(draft_scale, target_scale)
+        assert draft_scale.data_ptr() != target_scale.data_ptr()
+        assert getattr(draft_attn, f"_{prefix}_scale_float") == value
+        torch.testing.assert_close(
+            getattr(draft_attn, f"_{prefix}_scale_cpu"), torch.tensor(value)
+        )
