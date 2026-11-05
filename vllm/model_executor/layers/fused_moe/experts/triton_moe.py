@@ -15,6 +15,9 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
 )
+from vllm.model_executor.layers.fused_moe.experts.gelu_tanh_mul_token_quant import (
+    gelu_tanh_mul_token_quant,
+)
 from vllm.model_executor.layers.fused_moe.experts.lora_experts_mixin import (
     LoRAExpertsMixin,
 )
@@ -642,6 +645,23 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 intermediate_cache1.view(-1, N),
                 group_size=128,
                 quant_dtype=current_platform.fp8_dtype(),
+            )
+        elif (
+            # Fuse GELU-tanh+Mul with the dynamic per-token FP8 quant of the
+            # second GEMM's input (e.g. Gemma 4 with per-channel FP8 weights),
+            # skipping the BF16 round trip. Only benchmarked on CUDA.
+            current_platform.is_cuda()
+            and activation == MoEActivation.GELU_TANH
+            and self.quant_config.use_fp8_w8a8
+            and self.per_act_token_quant
+            and self.block_shape is None
+            and a2_scale is None
+            and not self.quantization_emulation
+            and lora_context is None
+            and intermediate_cache1.dtype in (torch.bfloat16, torch.float16)
+        ):
+            qintermediate_cache2, a2q_scale = gelu_tanh_mul_token_quant(
+                intermediate_cache1.view(-1, N)
             )
         else:
             self.activation(
